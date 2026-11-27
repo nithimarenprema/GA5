@@ -1,5 +1,6 @@
 fastapi
-uvicorn[standard]
-sentence-transformers
+uvicorn
 numpy
 scikit-learn
+onnxruntime
+tokenizers
