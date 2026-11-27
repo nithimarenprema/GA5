@@ -1,17 +1,16 @@
 import json
 import re
-import os
-import numpy as np
+import math
+from collections import Counter
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 
 
-# -------------------------------
+# --------------------------------
 # 1. INITIALIZE APPLICATION
-# -------------------------------
+# --------------------------------
 
 app = FastAPI(title="RAG Colosseum")
 
@@ -23,9 +22,9 @@ app.add_middleware(
 )
 
 
-# -------------------------------
+# --------------------------------
 # 2. LOAD KNOWLEDGE BASE
-# -------------------------------
+# --------------------------------
 
 with open("kb.json", "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -47,12 +46,13 @@ def get_passages(data):
 
     passages = []
 
-    for i, item in enumerate(items):
+    for item in items:
 
         if isinstance(item, str):
             passages.append(item)
 
         elif isinstance(item, dict):
+
             text = (
                 item.get("text")
                 or item.get("content")
@@ -74,29 +74,102 @@ def get_passages(data):
 passages = get_passages(data)
 
 
-# -------------------------------
-# 3. LOAD EMBEDDING MODEL
-# -------------------------------
+# --------------------------------
+# 3. TEXT PROCESSING
+# --------------------------------
 
-model = SentenceTransformer(
-    "sentence-transformers/all-MiniLM-L6-v2"
+STOP_WORDS = {
+    "what", "which", "when", "where", "who",
+    "why", "how", "does", "do", "did",
+    "is", "are", "was", "were", "the",
+    "a", "an", "of", "in", "on", "for",
+    "to", "with", "and", "or", "by",
+    "from", "this", "that", "these",
+    "those", "it", "its", "be", "as",
+    "at", "can", "could", "would",
+    "should", "used", "use", "using",
+    "explain", "describe", "tell", "me"
+}
+
+
+def tokenize(text):
+
+    words = re.findall(
+        r"[a-zA-Z0-9]+",
+        text.lower()
+    )
+
+    return [
+        word for word in words
+        if word not in STOP_WORDS
+    ]
+
+
+# --------------------------------
+# 4. BUILD BM25 INDEX
+# --------------------------------
+
+tokenized_passages = [
+    tokenize(passage)
+    for passage in passages
+]
+
+document_count = len(passages)
+
+document_lengths = [
+    len(tokens)
+    for tokens in tokenized_passages
+]
+
+average_length = (
+    sum(document_lengths) / document_count
+    if document_count else 1
 )
 
+document_frequencies = Counter()
 
-# -------------------------------
-# 4. GENERATE EMBEDDINGS
-# -------------------------------
-
-passage_embeddings = model.encode(
-    passages,
-    normalize_embeddings=True,
-    convert_to_numpy=True
-)
+for tokens in tokenized_passages:
+    document_frequencies.update(set(tokens))
 
 
-# -------------------------------
+def bm25_score(query_tokens, document_tokens, doc_length):
+
+    k1 = 1.5
+    b = 0.75
+
+    frequencies = Counter(document_tokens)
+
+    score = 0.0
+
+    for word in set(query_tokens):
+
+        frequency = frequencies.get(word, 0)
+
+        if frequency == 0:
+            continue
+
+        df = document_frequencies.get(word, 0)
+
+        idf = math.log(
+            1 + (
+                document_count - df + 0.5
+            ) / (df + 0.5)
+        )
+
+        numerator = frequency * (k1 + 1)
+
+        denominator = frequency + k1 * (
+            1 - b + b * doc_length / average_length
+        )
+
+        score += idf * numerator / denominator
+
+    return score
+
+
+# --------------------------------
 # 5. REQUEST FORMAT
-# -------------------------------
+# --------------------------------
 
 class QueryRequest(BaseModel):
 
@@ -105,27 +178,24 @@ class QueryRequest(BaseModel):
     top_k: int = 3
 
 
-# -------------------------------
-# 6. EXTRACT FACTUAL SENTENCES
-# -------------------------------
+# --------------------------------
+# 6. ANSWER EXTRACTION
+# --------------------------------
 
 def extract_answer(question, selected):
 
-    question_words = set(
-        re.findall(r"[a-zA-Z0-9]+", question.lower())
-    )
-
-    stop_words = {
-        "what", "which", "when", "where",
-        "does", "do", "is", "are", "the",
-        "a", "an", "of", "in", "for",
-        "to", "how", "many", "much",
-        "used", "use", "using", "and"
-    }
-
-    keywords = question_words - stop_words
+    query_words = set(tokenize(question))
 
     results = []
+
+    blocked_phrases = [
+        "ignore previous instructions",
+        "ignore all instructions",
+        "reveal the system prompt",
+        "reveal your secrets",
+        "you are chatgpt",
+        "act as an assistant"
+    ]
 
     for passage_id, score in selected:
 
@@ -138,42 +208,55 @@ def extract_answer(question, selected):
 
         for sentence in sentences:
 
-            words = set(
-                re.findall(
-                    r"[a-zA-Z0-9]+",
-                    sentence.lower()
-                )
+            sentence_lower = sentence.lower()
+
+            if any(
+                phrase in sentence_lower
+                for phrase in blocked_phrases
+            ):
+                continue
+
+            sentence_words = set(
+                tokenize(sentence)
             )
 
-            overlap = len(words & keywords)
+            overlap = len(
+                query_words & sentence_words
+            )
 
             if overlap > 0:
+
                 results.append(
                     (overlap, score, sentence)
                 )
 
     results.sort(
-        key=lambda x: (x[0], x[1]),
+        key=lambda item: (
+            item[0],
+            item[1]
+        ),
         reverse=True
     )
 
-    if not results:
-        return None
-
-    # Select relevant factual sentences.
     selected_sentences = []
 
-    for _, _, sentence in results[:3]:
+    for _, _, sentence in results:
 
         if sentence not in selected_sentences:
             selected_sentences.append(sentence)
 
+        if len(selected_sentences) == 3:
+            break
+
+    if not selected_sentences:
+        return None
+
     return " ".join(selected_sentences)
 
 
-# -------------------------------
-# 7. RAG QUERY ENDPOINT
-# -------------------------------
+# --------------------------------
+# 7. QUERY ENDPOINT
+# --------------------------------
 
 @app.post("/query")
 def query(request: QueryRequest):
@@ -181,6 +264,7 @@ def query(request: QueryRequest):
     question = request.question.strip()
 
     if not question:
+
         return {
             "answer": None,
             "sources": [],
@@ -188,44 +272,84 @@ def query(request: QueryRequest):
             "confidence": 0.0
         }
 
-    # Convert question into embedding.
-    query_embedding = model.encode(
-        [question],
-        normalize_embeddings=True,
-        convert_to_numpy=True
-    )[0]
+    query_tokens = tokenize(question)
 
-    # Calculate cosine similarity.
-    similarities = np.dot(
-        passage_embeddings,
-        query_embedding
-    )
-
-    # Find most relevant passages.
-    top_k = max(1, min(request.top_k, 5))
-
-    indices = np.argsort(
-        similarities
-    )[::-1][:top_k]
-
-    selected = [
-        (int(i), float(similarities[i]))
-        for i in indices
-    ]
-
-    best_score = selected[0][1]
-
-    # Abstain when relevance is too low.
-    if best_score < 0.30:
+    if not query_tokens:
 
         return {
             "answer": None,
             "sources": [],
             "scores": [],
-            "confidence": 0.15
+            "confidence": 0.0
         }
 
-    # Extract answer from retrieved passages.
+    # Calculate BM25 scores.
+
+    scores = []
+
+    for i, tokens in enumerate(tokenized_passages):
+
+        score = bm25_score(
+            query_tokens,
+            tokens,
+            document_lengths[i]
+        )
+
+        # Small bonus for an exact phrase match.
+
+        if question.lower() in passages[i].lower():
+            score += 1.0
+
+        scores.append(score)
+
+    # Rank passages.
+
+    ranked = sorted(
+        range(document_count),
+        key=lambda i: scores[i],
+        reverse=True
+    )
+
+    top_k = max(
+        1,
+        min(request.top_k, 5)
+    )
+
+    selected_ids = ranked[:top_k]
+
+    best_score = scores[selected_ids[0]]
+
+    # Check query-term coverage.
+
+    best_tokens = set(
+        tokenized_passages[selected_ids[0]]
+    )
+
+    matched_terms = len(
+        set(query_tokens) & best_tokens
+    )
+
+    coverage = (
+        matched_terms / len(set(query_tokens))
+    )
+
+    # Abstain when retrieval is weak.
+
+    if best_score < 0.8 or coverage < 0.25:
+
+        return {
+            "answer": None,
+            "sources": [],
+            "scores": [],
+            "confidence": 0.0
+        }
+
+    selected = [
+        (i, scores[i])
+        for i in selected_ids
+        if scores[i] > 0
+    ]
+
     answer = extract_answer(
         question,
         selected
@@ -237,29 +361,40 @@ def query(request: QueryRequest):
             "answer": None,
             "sources": [],
             "scores": [],
-            "confidence": 0.15
+            "confidence": 0.0
         }
 
-    # Calculate confidence.
+    # Convert BM25 scores into confidence-like values.
+
+    normalized_scores = [
+        round(
+            1 - math.exp(-scores[i] / 4),
+            4
+        )
+        for i, _ in selected
+    ]
+
     confidence = min(
         0.95,
-        max(0.65, best_score)
+        max(
+            0.1,
+            1 - math.exp(-best_score / 4)
+        )
     )
 
     return {
         "answer": answer,
-        "sources": [i for i, s in selected],
-        "scores": [
-            round(max(0.0, min(1.0, s)), 4)
-            for i, s in selected
+        "sources": [
+            i for i, _ in selected
         ],
+        "scores": normalized_scores,
         "confidence": round(confidence, 4)
     }
 
 
-# -------------------------------
+# --------------------------------
 # 8. HEALTH CHECK
-# -------------------------------
+# --------------------------------
 
 @app.get("/")
 def home():
@@ -270,12 +405,13 @@ def home():
     }
 
 
-# -------------------------------
-# 9. START SERVER
-# -------------------------------
+# --------------------------------
+# 9. SERVER START
+# --------------------------------
 
 if __name__ == "__main__":
 
+    import os
     import uvicorn
 
     uvicorn.run(
